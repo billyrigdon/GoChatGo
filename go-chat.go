@@ -10,15 +10,15 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
-	markdown "github.com/MichaelMure/go-term-markdown"
 	"github.com/alecthomas/chroma/styles"
 	tiktoken "github.com/pkoukk/tiktoken-go"
 )
@@ -29,6 +29,8 @@ var (
 var (
 	encoder *tiktoken.Tiktoken
 )
+
+var useFusion *bool
 
 func init() {
 	var err error
@@ -133,10 +135,7 @@ func queryGPT(model, systemPrompt string, temp float64, maxTok int,
 		fmt.Print(text)
 		answer.WriteString(text)
 	}
-	fmt.Println()
 	resp.Body.Close()
-
-	prettyPrint(answer.String())
 
 	return answer.String()
 }
@@ -295,10 +294,6 @@ func saveState(st AppState) {
 	_ = os.WriteFile(stateFilePath, data, 0o644)
 }
 
-func sendNotification(title, body string) {
-	_ = exec.Command("notify-send", title, body).Run()
-}
-
 func promptUserForInstructions(filePath string) {
 	content, err := os.ReadFile(filePath)
 	if err != nil {
@@ -396,6 +391,7 @@ func init() {
 }
 
 func main() {
+	useFusion = flag.Bool("fusion", false, "Use multi-model fusion mode")
 	clearLog := flag.Bool("c", false, "Clear chat log")
 	personality := flag.String("p", "", "Set AI personality")
 	printLog := flag.Bool("a", false, "Print today's log")
@@ -463,10 +459,56 @@ func buildHistory(system, latest string) []Message {
 	)
 }
 
+func summarizeDayLogs() {
+	p := dailyLogPath()
+
+	data, err := os.ReadFile(p)
+	if err != nil {
+		return
+	}
+	var logs []ChatLog
+	if err := json.Unmarshal(data, &logs); err != nil {
+		return
+	}
+
+	var msgs []Message
+	for _, l := range logs {
+		msgs = append(msgs, Message{Role: "user", Content: l.Request})
+		msgs = append(msgs, Message{Role: "assistant", Content: l.Response})
+	}
+
+	summary := queryGPT(
+		modelSummarise,
+		"Summarize this conversation to preserve key facts, decisions, tone, and ongoing themes.",
+		0.4, 512, msgs, false,
+	)
+
+	saveVectorMemory(summary)
+}
+
 func sendChat(userPrompt string) {
 	cfg := getConfig()
-	system := fmt.Sprintf("You are %s. User = %s. Bio: %s. Personality: %s.", cfg.AIName, cfg.UserName, cfg.Bio, cfg.Personality)
+	relevant := getRelevantMemories(userPrompt, 3)
+	memories := strings.Join(relevant, "\n\n")
 
+	system := fmt.Sprintf(
+		"You are %s. User = %s. Bio: %s. Personality: %s.\nYour relevant memories:\n%s",
+		cfg.AIName, cfg.UserName, cfg.Bio, cfg.Personality, memories,
+	)
+
+	if !*useFusion {
+		msgs := buildHistory(system, userPrompt)
+		answer := queryGPT(modelExec, system, 0.6, 1024, msgs, true)
+		if err := appendLog(userPrompt, answer); err != nil {
+			log.Printf("append log: %v", err)
+		}
+
+		summarizeDayLogs()
+
+		return
+	}
+
+	// Fusion path (as-is)
 	mem := queryGPT(modelSummarise, "Summarise the dialogue so far.", 0.4, 512, buildHistory(system, userPrompt), false)
 
 	leftMsgs := []Message{{Role: "system", Content: tagMem + mem + tagEnd}, {Role: "user", Content: userPrompt}}
@@ -534,7 +576,6 @@ var monokai = map[string]string{
 	",":         "\033[31m", // Red
 }
 
-
 func init() {
 	user, err := user.Current()
 	if err != nil {
@@ -552,24 +593,6 @@ func init() {
 			log.Fatalf("Error creating log directory: %v", err)
 		}
 	}
-}
-
-func displayHelp() {
-	fmt.Println("Usage: go-chat [options] \"prompt goes here\"")
-	fmt.Println("Options:")
-	fmt.Println("  -c               Clear the chat log")
-	fmt.Println("  -p <personality> Set the AI's personality")
-	fmt.Println("  -a               Print the current day's chat log")
-	fmt.Println("  -n <number>      Print the last n entries from the chat log")
-	fmt.Println("  -i               Enter interactive mode")
-	fmt.Println("  -d               Run as daemon")
-	fmt.Println("  -r               Receive new message")
-	fmt.Println("  -t               Toggle check-in feature")
-	fmt.Println("  -f <file>        Upload a code file to GPT")
-	fmt.Println("  -u <name>        Set your name")
-	fmt.Println("  -ai <name>       Set the AI's name")
-	fmt.Println("  -b <bio>         Set your bio")
-	fmt.Println("  -h               Display help")
 }
 
 func getChatHistory() []Message {
@@ -597,21 +620,105 @@ func getChatHistory() []Message {
 	return msgs
 }
 
-func processAndHighlight(text string) string {
-	rendered := markdown.Render(text, 120, 2)
-
-	return string(rendered)
+type VectorMemory struct {
+	Text      string    `json:"text"`
+	Embedding []float32 `json:"embedding"`
 }
 
-// at the top of queryGPT.go (or any util file)
-func prettyPrint(ans string) {
-	// optional separator so you can still see the raw stream above
-	fmt.Println("\n\x1b[38;5;240m── formatted ───────────────────────────────────────────\x1b[0m")
+const vectorStorePath = ".go-chat-memory-vectors.json"
 
-	rendered := markdown.Render(
-		strings.TrimSpace(ans), // go‑term‑markdown handles code fences & colours
-		120,                    // wrap width
-		6,                      // tab width
-	)
-	fmt.Print(string(rendered))
+func embedText(text string) ([]float32, error) {
+	payload := map[string]any{
+		"model": "text-embedding-3-small",
+		"input": text,
+	}
+
+	body, _ := json.Marshal(payload)
+	req, _ := http.NewRequest("POST", apiURL+"/v1/embeddings", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var out struct {
+		Data []struct {
+			Embedding []float32 `json:"embedding"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	if len(out.Data) == 0 {
+		return nil, errors.New("no embeddings returned")
+	}
+	return out.Data[0].Embedding, nil
+}
+
+func saveVectorMemory(text string) {
+	vec, err := embedText(text)
+	if err != nil {
+		log.Printf("embedding error: %v", err)
+		return
+	}
+
+	p := filepath.Join(homeDir, vectorStorePath)
+	var store []VectorMemory
+
+	if data, err := os.ReadFile(p); err == nil {
+		_ = json.Unmarshal(data, &store)
+	}
+
+	store = append(store, VectorMemory{Text: text, Embedding: vec})
+	data, _ := json.MarshalIndent(store, "", "  ")
+	_ = os.WriteFile(p, data, 0644)
+}
+
+func cosineSim(a, b []float32) float64 {
+	var sum, normA, normB float64
+	for i := range a {
+		sum += float64(a[i] * b[i])
+		normA += float64(a[i] * a[i])
+		normB += float64(b[i] * b[i])
+	}
+	if normA == 0 || normB == 0 {
+		return 0
+	}
+	return sum / (math.Sqrt(normA) * math.Sqrt(normB))
+}
+
+func getRelevantMemories(prompt string, topK int) []string {
+	vec, err := embedText(prompt)
+	if err != nil {
+		return nil
+	}
+
+	p := filepath.Join(homeDir, vectorStorePath)
+	var store []VectorMemory
+	if data, err := os.ReadFile(p); err == nil {
+		_ = json.Unmarshal(data, &store)
+	}
+
+	type Scored struct {
+		Text  string
+		Score float64
+	}
+	var scored []Scored
+	for _, mem := range store {
+		score := cosineSim(mem.Embedding, vec)
+		scored = append(scored, Scored{Text: mem.Text, Score: score})
+	}
+
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].Score > scored[j].Score
+	})
+
+	var top []string
+	for i := 0; i < topK && i < len(scored); i++ {
+		top = append(top, scored[i].Text)
+	}
+	return top
 }
